@@ -35,6 +35,8 @@ services:
       - "log_min_duration_statement=500"
       - "-c"
       - "deadlock_timeout=1s"
+      - "-c"
+      - "max_parallel_workers_per_gather=0"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

@@ -1,11 +1,15 @@
 -- Core schema for the log ingestion/query service.
 --
 -- Design notes (see README for the full rationale):
---   * `logs` is RANGE-partitioned by day on `timestamp`. This keeps each
---     partition's indexes small (fast writes, fast index-only ordered
---     scans) and turns retention into a `DROP TABLE` on whole partitions
---     instead of a row-by-row DELETE, so expiry never holds a
---     long-running lock or bloats the heap.
+--   * `logs` is RANGE-partitioned by week on `timestamp` (see
+--     db/partitions.ts). This keeps each partition's indexes small (fast
+--     writes, fast index-only ordered scans), turns retention into a
+--     `DROP TABLE` on whole partitions instead of a row-by-row DELETE (so
+--     expiry never holds a long-running lock or bloats the heap), AND
+--     keeps the partition *count* low enough that query planning stays
+--     cheap — Postgres evaluates every partition's range at plan time
+--     regardless of pruning, so a 30-day window as ~5 weekly partitions
+--     plans far faster than the same window as ~30 daily ones.
 --   * `attributes` stores the arbitrary key/value payload as-is (typed
 --     JSONB) so it round-trips exactly through GET /logs.
 --   * `attributes_text` is a derived, write-once JSONB column where every
@@ -35,9 +39,9 @@ CREATE TABLE IF NOT EXISTS logs (
   PRIMARY KEY (id, "timestamp")
 ) PARTITION BY RANGE ("timestamp");
 
--- Catch-all partition for rows outside the pre-created daily range (e.g.
+-- Catch-all partition for rows outside the pre-created weekly range (e.g.
 -- historical backfills or clock skew). Kept tiny in practice because the
--- partition-maintenance job keeps real daily partitions ahead of time.
+-- partition-maintenance job keeps real weekly partitions ahead of time.
 CREATE TABLE IF NOT EXISTS logs_default PARTITION OF logs DEFAULT;
 
 -- Primary access path: filter by time range, sorted newest-first, with a
