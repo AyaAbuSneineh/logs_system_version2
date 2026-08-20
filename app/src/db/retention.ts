@@ -20,6 +20,12 @@ export async function runRetentionSweep(pool: Pool, retentionDays: number): Prom
     }
   }
 
+  // logs_rollup holds per-(minute, service, level) partial counts rather
+  // than one row per log line, so it stays orders of magnitude smaller
+  // than `logs` — a plain indexed DELETE here is cheap and doesn't need
+  // the partition-drop treatment the raw table requires.
+  await pool.query("DELETE FROM logs_rollup WHERE bucket_start < $1", [cutoff]);
+
   return dropped;
 }
 

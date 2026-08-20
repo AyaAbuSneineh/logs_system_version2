@@ -111,6 +111,39 @@ async function main() {
     check(Array.isArray(body.buckets) && body.buckets.length > 0, "GET /logs/aggregate returns buckets");
   }
 
+  // --- GET /logs/aggregate: a bucket coarser than the rollup's own
+  // per-minute granularity must still merge rows from different minutes
+  // into one bucket. Regression test for a bug where `GROUP BY
+  // bucket_start` silently resolved to logs_rollup's raw per-minute
+  // column instead of the re-bucketed `date_bin(...)` alias that shadows
+  // it, so a 1h/1d bucket displayed the right label but never actually
+  // merged rows from different minutes. ---
+  {
+    const minuteAgo = new Date(Date.now() - 90 * 1000).toISOString();
+    const ingestRes = await fetch(`${BASE_URL}/logs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        logs: [
+          { timestamp: now, level: "warn", service: "smoke-test-rollup", message: "a" },
+          { timestamp: minuteAgo, level: "warn", service: "smoke-test-rollup", message: "b" },
+        ],
+      }),
+    });
+    check((await ingestRes.json()).accepted === 2, "aggregate regression setup: both entries accepted");
+
+    const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const until = new Date(Date.now() + 60 * 1000).toISOString();
+    const res = await fetch(
+      `${BASE_URL}/logs/aggregate?service=smoke-test-rollup&since=${since}&until=${until}&bucket=1h`,
+    );
+    const body = await res.json();
+    check(
+      Array.isArray(body.buckets) && body.buckets.length === 1 && body.buckets[0].count === 2,
+      "GET /logs/aggregate merges same-hour rows spanning different minutes into one bucket",
+    );
+  }
+
   // --- GET /logs/aggregate: missing required param -> 400 ---
   {
     const res = await fetch(`${BASE_URL}/logs/aggregate?bucket=1m`);
