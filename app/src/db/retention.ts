@@ -1,16 +1,19 @@
 import type { Pool } from "pg";
-import { dropPartition, listDailyPartitions } from "./partitions.js";
+import { dropPartition, listPartitions } from "./partitions.js";
 
 /**
- * Drops any daily partition whose entire range is older than
- * `retentionDays`. Because this drops whole partitions instead of
- * deleting matching rows, it runs in roughly constant time regardless of
- * how much data is expiring, and never competes with ingestion for a
- * table-wide lock or leaves dead tuples behind for autovacuum to clean up.
+ * Drops any partition whose entire range is older than `retentionDays`.
+ * Because partitions are weekly (see db/partitions.ts), a partition is
+ * kept until its whole 7-day period has passed the cutoff — so retained
+ * data can lag up to ~6 days past the exact `retentionDays` boundary.
+ * Dropping whole partitions instead of deleting matching rows still runs
+ * in roughly constant time regardless of how much data is expiring, and
+ * never competes with ingestion for a table-wide lock or leaves dead
+ * tuples behind for autovacuum to clean up.
  */
 export async function runRetentionSweep(pool: Pool, retentionDays: number): Promise<string[]> {
   const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-  const partitions = await listDailyPartitions(pool);
+  const partitions = await listPartitions(pool);
   const dropped: string[] = [];
 
   for (const partition of partitions) {

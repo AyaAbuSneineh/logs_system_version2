@@ -10,7 +10,7 @@ async function main(): Promise<void> {
   await runMigrations(writePool);
 
   // Cover the full retention window so that any in-policy timestamp (not
-  // just "recent" ones) lands in a real daily partition instead of the
+  // just "recent" ones) lands in a real weekly partition instead of the
   // `logs_default` catch-all. Backfills or historical test data spread
   // across the retention window still get proper partition pruning and a
   // fast, lock-free drop once they expire.
