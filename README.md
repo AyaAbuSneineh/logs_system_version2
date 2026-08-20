@@ -9,6 +9,7 @@ source of truth for both reads and writes; there is no cache or secondary datast
 - [Setup and usage](#setup-and-usage)
 - [API documentation](#api-documentation)
 - [Schema and index design](#schema-and-index-design)
+- [Pre-aggregated rollups](#pre-aggregated-rollups)
 - [Attribute storage strategy](#attribute-storage-strategy)
 - [Retention strategy](#retention-strategy)
 - [Performance](#performance)
@@ -170,6 +171,77 @@ Planning Time: 6.391 ms
 Execution Time: 17.216 ms
 ```
 
+## Pre-aggregated rollups
+
+`GET /logs/aggregate` doesn't only read `logs` directly — it also has a second, faster
+path through a small pre-aggregated table:
+
+```sql
+CREATE TABLE logs_rollup (
+  bucket_start timestamptz NOT NULL,
+  service text NOT NULL,
+  level text NOT NULL,
+  count bigint NOT NULL
+);
+```
+
+**Why this exists.** A well-indexed aggregate query over `logs` still costs
+`O(matching rows)` — a perfect index makes each row cheap to touch, it can't make
+touching hundreds of thousands of them free. That's invisible in a query bounded to a
+small window (the `EXPLAIN ANALYZE` above runs in 17ms), but running the actual
+grading-style load generator (`Ahmad-Abbas-Foothill/logs-benchmark-cli`) against this
+service exposed a much harder pattern I hadn't originally tested for: its
+read-after-write check repeatedly polls `GET /logs/aggregate?service=<marker>&since=<test
+start>&until=now&bucket=1d`, where `since` is pinned to when the test started. The
+matched row count grows from zero up to the test's entire accepted-row count over its
+own runtime — a query whose cost keeps climbing throughout the run, not a fixed cost per
+call. Under that pattern, aggregate p95 reached 8–15 seconds (see git history for the
+full benchmark report) — high enough that some of the tool's own polls hit its 10-second
+client timeout.
+
+`logs_rollup` fixes the actual scaling problem rather than tuning around it: it holds
+partial counts per `(minute, service, level)`, written in the same transaction as the raw
+insert (`services/ingest.ts`) and summed at query time, so `GET /logs/aggregate` can
+answer from it instead of `logs` whenever the request has no `attr.<key>` or `q` filter
+(`attr`/`q` have no column here — collapsing by them would blow the rollup's cardinality
+back up toward the raw table's, so those still fall back to the `logs`-scanning query in
+[`lib/aggregateBuilder.ts`](app/src/lib/aggregateBuilder.ts)). Reading from the rollup
+costs `O(distinct minute/service/level combinations in range)`, not `O(matching log
+rows)` — decoupled from total ingested volume, so it stops getting slower as a scenario
+runs longer. Measured at 1.2M raw rows: `logs` (all partitions, with indexes) is 474MB;
+`logs_rollup` is 8.3MB for ~96,000 rows — about a 57x storage reduction and 12.5x fewer
+rows to scan for the same question. See [Performance](#performance) for the before/after
+latency numbers.
+
+**Why it's append-only, not an upserted counter.** The first version used
+`INSERT ... ON CONFLICT (bucket_start, service, level) DO UPDATE SET count = count + 1`.
+That's wrong for this workload: realistic ingestion has *recent* timestamps, meaning most
+concurrent traffic lands in the same one or two minute-buckets across a handful of
+services — a small, hot set of keys. Every concurrent request's chunk needed a row lock
+on one of those same rows, which both serialized throughput (ingestion dropped from
+~15,500/s to ~6,500/s under concurrency) and, worse, occasionally deadlocked two
+transactions that locked an overlapping pair of keys in opposite orders
+(Postgres error `40P01`, confirmed live under load — see git history). Making the table
+append-only — one partial-count row per ingest chunk per key, summed with `SUM(count)`
+at query time instead of merged with `ON CONFLICT` at write time — means concurrent
+inserts never lock against each other at all, since there's no shared row to contend
+over. `SUM()` is correct whether there's one physical row or a thousand for a given key;
+the trade-off, and the reason this isn't a free lunch, is that the table then grows
+roughly with `(ingested rows / batch chunk size)` rather than staying strictly bounded by
+distinct-key cardinality — see [Known limitations](#known-limitations).
+
+A second, unrelated bug surfaced while verifying this end to end:
+`GROUP BY bucket_start` silently resolved to `logs_rollup`'s own raw per-minute
+`bucket_start` column instead of the `date_bin(...) AS bucket_start` alias that shadows
+it, since the source table happens to have a real column of that name (`logs`, keyed on
+`"timestamp"` instead, has no such collision). The query still *displayed* the correct
+re-bucketed label, but silently grouped at the wrong (finer) granularity underneath,
+producing multiple rows where a coarser bucket should have merged them into one. Fixed by
+referencing the `SELECT` list positionally (`GROUP BY 1, 2` / `ORDER BY 1, 2`), and locked
+in with both a unit test and a live-database regression check in the CI smoke test
+(`scripts/smoke-test.mjs`) that specifically ingests across a minute boundary and asserts
+a `1h` bucket merges them.
+
 ## Attribute storage strategy
 
 Attributes are stored **twice**, deliberately:
@@ -256,10 +328,18 @@ partition creation.
 
 | Batch size | Concurrency | Timestamp pattern | Dataset | Sustained rate |
 | --- | --- | --- | --- | --- |
-| 2,000 | 16 | Recent (realistic — see note) | 1,000,000 rows | **~15,500 logs/sec** |
-| 2,000 | 16 | Spread over 30 days | 1,000,000 rows | ~10,700–13,000 logs/sec |
+| 2,000 | 16 | Recent (realistic — see note) | 1,000,000 rows | **~13,675 logs/sec** |
+| 2,000 | 16 | Spread over 30 days | 500,000 rows | ~9,275 logs/sec |
 
-Zero dropped requests, zero 5xx responses, zero crashes in every run.
+Zero dropped requests, zero 5xx responses, zero crashes, zero deadlocks in every run.
+
+These numbers include the rollup maintenance described in
+[Pre-aggregated rollups](#pre-aggregated-rollups) — an appended row and an extra
+transaction per 500-row chunk — which costs a real, measured ~12% of raw ingestion
+throughput (down from ~15,500/s pre-rollup) in exchange for the aggregate latency
+improvement below. That trade was made deliberately: the performance target is 15,000/s
+*and* aggregate queries fast under load, and the rollup was the change that got aggregate
+p95 from four digits of milliseconds to three.
 
 **Note on timestamp pattern:** a log-ingestion workload's timestamps cluster around
 the current time — that's the "recent" row above, and the one used for the headline
@@ -274,20 +354,25 @@ current logs would produce.
 ### Query latency while ingestion is active
 
 Measured with the aggregate endpoint hit at exactly the contractual rate (1 request/sec)
-throughout a full 1M-row, ~15.5k/s ingestion run:
+throughout a full 1M-row, ~13.7k/s ingestion run, served from the rollup path:
 
 | Query | p50 | p95 | p99 | max |
 | --- | --- | --- | --- | --- |
-| `GET /logs/aggregate` (1 req/s, per contract) | 210ms | **851ms** | 1022ms | 1022ms |
+| `GET /logs/aggregate` (1 req/s, per contract) | 79.3ms | **297.6ms** | 330.1ms | 330.1ms |
 
 Under a deliberately harsher-than-spec load (aggregate **and** two `GET /logs`
-variants, all three concurrently, once per second — 3x the required query rate):
+variants, all three concurrently, once per second — 3x the required query rate — while a
+200,000-row ingestion burst runs concurrently):
 
 | Query | p50 | p95 | p99 | max |
 | --- | --- | --- | --- | --- |
-| `GET /logs/aggregate` | 282ms | 1083ms | 3386ms | 3386ms |
-| `GET /logs?service=&level=&limit=100` | 151ms | 379ms | 972ms | 972ms |
-| `GET /logs?attr.region=&limit=100` | 88ms | 306ms | 987ms | 987ms |
+| `GET /logs/aggregate` | 38.6ms | 273.9ms | 296.2ms | 296.2ms |
+| `GET /logs?service=checkout&level=error&limit=100` | 16.9ms | 272.6ms | 485.4ms | 485.4ms |
+| `GET /logs?attr.region=eu-west&limit=100` | 10.4ms | 295.7ms | 387.5ms | 387.5ms |
+
+For comparison, the pre-rollup numbers for the same 1x/3x scenarios were 851ms/1083ms p95
+and 1022ms/3386ms p99 — the rollup is the single biggest latency win in this project, by
+a wide margin (see [Pre-aggregated rollups](#pre-aggregated-rollups) for why).
 
 In isolation (no concurrent ingestion), the same aggregate query against the same
 1M-row table runs in ~17ms (see the `EXPLAIN ANALYZE` above) — confirming the latency
@@ -296,10 +381,11 @@ problem.
 
 ### Resource usage
 
-- **App**: ~45–52% CPU (near its 0.5 CPU cap) during sustained ingestion, 50–80MB RAM
+- **App**: ~45–52% CPU (near its 0.5 CPU cap) during sustained ingestion, 20–80MB RAM
   — well inside the 256MB limit.
 - **Postgres**: 50–100% CPU during sustained ingestion (the actual bottleneck),
-  peaking around 650MB RAM at 1M rows — inside the 1GB limit with headroom.
+  ~515MB RAM at 1.2M raw rows plus ~96,000 rollup rows — inside the 1GB limit with
+  headroom. The rollup table's own footprint is small (8.3MB at that scale).
 
 ### Bottlenecks discovered and optimizations applied
 
@@ -320,14 +406,41 @@ problem.
    spikes in CPU-limited containers that isn't visible in average-CPU% metrics).
    Chunking each incoming batch into ≤500-row `INSERT` statements on the same
    connection (`services/ingest.ts`) gives the scheduler natural yield points between
-   chunks. This one change took aggregate p95 from **13+ seconds down to under
-   500ms** in local testing — the single biggest latency win in the project.
+   chunks. This one change took aggregate p95 from 13+ seconds down to under 500ms in
+   local testing at the time — later superseded by the rollup below as the biggest
+   single win once tested against a harder query pattern.
 4. **Un-pruned partition coverage silently defeated partitioning.** Early testing only
    pre-created partitions for ±2 days around "now"; a workload with timestamps spread
    further out landed almost entirely in the `logs_default` catch-all, which grew
    large enough to erase every benefit of partitioning (bloated index, no pruning).
    Fixed by covering the full retention window at startup.
-5. Postgres tuned for a write-heavy, resource-capped workload:
+5. **Running the actual grading-style load generator surfaced a harder aggregate access
+   pattern than my own test harness modeled** — its read-after-write check polls an
+   ever-widening `since=<test start>&until=now` range, so the matched row count (and
+   query cost) grows for as long as the scenario runs, unlike a fixed recent window.
+   That pattern pushed aggregate p95 into multiple seconds and directly motivated
+   [pre-aggregated rollups](#pre-aggregated-rollups) — turning an
+   `O(matching log rows)` query into an `O(distinct minute/service/level combinations)`
+   one took p95 from ~851–1083ms down to ~274–298ms across both the 1x and 3x query-rate
+   scenarios.
+6. **A `GROUP BY` name collision produced silently-wrong aggregation.** The rollup query
+   selects `date_bin(...) AS bucket_start` from a table that also has a real
+   `bucket_start` column; `GROUP BY bucket_start` resolved to the raw column, not the
+   alias, so a coarser bucket (`1h`/`1d`) displayed the right label per row but never
+   actually merged rows from different minutes. Caught by testing the actual HTTP
+   response against hand-computed expected counts rather than trusting the SQL string
+   shape — fixed with positional `GROUP BY 1, 2` and locked in with a regression test.
+7. **`ON CONFLICT DO UPDATE` on the rollup caused both a deadlock and a throughput
+   collapse under concurrency.** With realistic "recent" timestamps, most concurrent
+   ingestion requests target the same small set of (minute, service, level) keys;
+   upserting into them serializes on row locks and, under high concurrency, occasionally
+   deadlocked two transactions that locked an overlapping pair of keys in opposite
+   orders (Postgres `40P01`, reproduced live). Ingestion throughput had dropped from
+   ~15,500/s to ~6,500/s before this was diagnosed. Making the rollup append-only (sum
+   at read time instead of merging at write time) removed the contention entirely and
+   recovered throughput to ~13,675/s — the remaining ~12% versus pre-rollup is the
+   measured cost of the extra transaction and insert per chunk, not contention.
+8. Postgres tuned for a write-heavy, resource-capped workload:
    `synchronous_commit=off` (safe here — a crash loses at most the last fraction of a
    second of unflushed WAL, not committed data on disk corruption; there is no
    external system that must stay in sync), a larger `max_wal_size` /
@@ -336,13 +449,20 @@ problem.
 
 ## Optional features
 
-**None are implemented.** No authentication, API keys, multi-tenancy, rate limiting,
-dashboards, or other stretch goals — `docker compose up` with no configuration yields
-exactly the plain, unauthenticated core service on all four required endpoints, which
-is also what every measurement in this README was taken against. Given the fixed time
-budget, effort went entirely into making the core ingestion/query/retention path
-correct and fast under the stated resource limits rather than partially into stretch
-features.
+**No authentication, API keys, multi-tenancy, rate limiting, or dashboards.**
+`docker compose up` with no configuration yields exactly the plain, unauthenticated core
+service on all four required endpoints, which is also what every measurement in this
+README was taken against.
+
+**Pre-aggregated rollups** (one of the stretch goals named in the assignment) **are
+implemented**, but as an always-on internal optimization rather than a toggleable
+feature — there's no environment variable for it, and it can't be, since it never
+changes a response's shape or the set of requests that succeed (`GET /logs/aggregate`
+returns identical JSON whether a given call happens to be served from `logs_rollup` or
+from `logs` directly). See [Pre-aggregated rollups](#pre-aggregated-rollups). Given the
+fixed time budget, the remaining effort went into making the core ingestion/query/
+retention path correct and fast under the stated resource limits rather than partially
+into further stretch features (a dashboard, live tail, alerting, etc.).
 
 ## Known limitations
 
@@ -351,12 +471,22 @@ features.
   [Attribute storage strategy](#attribute-storage-strategy). It's fine when combined
   with other filters (the common case) but would be slow as the sole, unfiltered
   predicate over the full dataset.
-- **Query latency degrades under combined ingestion + above-spec query concurrency.**
-  The literal contract (1 aggregate request/sec while ingesting) is met with margin
-  (p95 851ms). Pushed to 3x that query rate concurrently, p99/max tail latency can
-  exceed 1s (see the second latency table). This is an inherent consequence of a
-  single-core Postgres container under simultaneous CPU-bound writes and reads, not a
-  query-plan issue (the same query takes ~17ms with no concurrent load).
+- **Query latency under combined ingestion + above-spec query concurrency.** The
+  literal contract (1 aggregate request/sec while ingesting) is met with wide margin
+  (p95 298ms). Pushed to 3x that query rate concurrently, p95/p99 stay under ~300–490ms
+  (see the second latency table) — comfortably inside the 1s target, though this is
+  measured at 1.2M rows on a single development machine, not the exact grading
+  environment.
+- **`logs_rollup` grows roughly with `(ingested rows / batch chunk size)`, not strictly
+  with distinct-key cardinality.** It's append-only rather than an upserted running
+  counter (see [Pre-aggregated rollups](#pre-aggregated-rollups) for why — the upserted
+  version deadlocked and serialized under concurrent load), so a given `(minute,
+  service, level)` key can be represented by many partial-count rows instead of one.
+  It's still ~57x smaller than `logs` at 1.2M rows (8.3MB vs. 474MB), and retention
+  prunes it on the same schedule as partitions, but at a much larger scale or much
+  longer retention window than tested here, a periodic background job that compacts
+  same-key rows via `SUM(count)` would keep it from growing indefinitely. Not
+  implemented given the time budget.
 - **`logs_default` is unbounded.** It exists only as a safety net for timestamps
   outside `[now - RETENTION_DAYS, now + PARTITION_LOOKAHEAD_DAYS]`(e.g. very old
   backfills); the retention sweep only targets named daily partitions. In normal
@@ -381,14 +511,18 @@ app/
     types.ts
     db/
       migrate.ts               # tiny SQL-file migration runner
-      migrations/001_init.sql  # schema, partitioning, indexes
+      migrations/
+        001_init.sql             # schema, partitioning, indexes
+        002_rollup.sql           # logs_rollup: pre-aggregated rollup table
       partitions.ts            # partition create/list/drop
-      retention.ts             # retention sweep loop
+      retention.ts             # retention sweep loop (partitions + rollup)
       pool.ts                  # split write/read connection pools
     lib/
       filters.ts                # shared query-param parsing/validation
       queryBuilder.ts            # GET /logs SQL builder (parameterized)
-      aggregateBuilder.ts        # GET /logs/aggregate SQL builder
+      aggregateBuilder.ts        # GET /logs/aggregate SQL builder (raw logs)
+      rollupQueryBuilder.ts       # GET /logs/aggregate SQL builder (logs_rollup)
+      rollup.ts                  # groups a batch into per-minute/service/level counts
       cursor.ts                  # opaque keyset cursor encode/decode
       errors.ts
     validation/logEntry.ts     # POST /logs per-entry validation
