@@ -30,6 +30,7 @@ export async function runRetentionSweep(pool: Pool, retentionDays: number): Prom
   await pool.query("DELETE FROM logs_rollup WHERE bucket_start < $1", [cutoff]);
 
   return dropped;
+  //anything
 }
 
 export function startRetentionLoop(
